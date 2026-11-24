@@ -1,0 +1,19 @@
+LIBRARY version.dll
+EXPORTS
+    GetFileVersionInfoA = tcp_GetFileVersionInfoA
+    GetFileVersionInfoByHandle = tcp_GetFileVersionInfoByHandle
+    GetFileVersionInfoExA = tcp_GetFileVersionInfoExA
+    GetFileVersionInfoExW = tcp_GetFileVersionInfoExW
+    GetFileVersionInfoSizeA = tcp_GetFileVersionInfoSizeA
+    GetFileVersionInfoSizeExA = tcp_GetFileVersionInfoSizeExA
+    GetFileVersionInfoSizeExW = tcp_GetFileVersionInfoSizeExW
+    GetFileVersionInfoSizeW = tcp_GetFileVersionInfoSizeW
+    GetFileVersionInfoW = tcp_GetFileVersionInfoW
+    VerFindFileA = tcp_VerFindFileA
+    VerFindFileW = tcp_VerFindFileW
+    VerInstallFileA = tcp_VerInstallFileA
+    VerInstallFileW = tcp_VerInstallFileW
+    VerLanguageNameA = tcp_VerLanguageNameA
+    VerLanguageNameW = tcp_VerLanguageNameW
+    VerQueryValueA = tcp_VerQueryValueA
+    VerQueryValueW = tcp_VerQueryValueW
