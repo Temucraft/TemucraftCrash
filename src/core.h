@@ -49,10 +49,14 @@ const char* ExceptionName(uint32_t code);
 
 // ---- ring buffers (lock free: many writers, one reader at crash time) ----
 
+enum { HEAD_BYTES = 16 };
+
 struct PacketEntry {
     uint32_t tick;   // GetTickCount when it went through
     uint32_t opcode;
     uint32_t size;   // bytes after the opcode
+    uint8_t headLen; // how many of the first bytes after the opcode are kept (server packets only)
+    uint8_t head[HEAD_BYTES];
 };
 
 template <unsigned N>
@@ -64,7 +68,8 @@ struct PacketRing {
     uint32_t next;
     Slot slots[N];
 
-    void Push(uint32_t tick, uint32_t opcode, uint32_t size) {
+    // head: the first bytes after the opcode (at most HEAD_BYTES are kept), or null
+    void Push(uint32_t tick, uint32_t opcode, uint32_t size, const uint8_t* head = nullptr, unsigned headLen = 0) {
         uint32_t i = __atomic_fetch_add(&next, 1u, __ATOMIC_RELAXED);
         Slot& s = slots[i % N];
         __atomic_store_n(&s.seq, 0u, __ATOMIC_RELAXED);
@@ -72,6 +77,10 @@ struct PacketRing {
         s.e.tick = tick;
         s.e.opcode = opcode;
         s.e.size = size;
+        if (!head) headLen = 0;
+        if (headLen > HEAD_BYTES) headLen = HEAD_BYTES;
+        s.e.headLen = static_cast<uint8_t>(headLen);
+        for (unsigned j = 0; j < headLen; j++) s.e.head[j] = head[j];  // bytes past headLen are never shown
         __atomic_store_n(&s.seq, i + 1, __ATOMIC_RELEASE);
     }
 
@@ -138,6 +147,93 @@ struct TextRing {
     uint32_t Total() const { return __atomic_load_n(&next, __ATOMIC_ACQUIRE); }
 };
 
+// ---- characters and races (for crashes with the custom races) ----
+
+enum { MAX_ENUM_CHARS = 12, MAX_CREATE_RACES = 48, MAX_DBC_COUNTS = 8 };
+
+struct CharSummary {
+    char name[24];
+    uint8_t race, cls, gender, skin, face, hairStyle, hairColor, facialHair, level;
+};
+
+// The last character list from the server (SMSG_CHAR_ENUM).
+struct CharList {
+    uint32_t tick;
+    uint8_t count;     // characters the packet says it has
+    uint8_t parsed;    // characters read before the data ran out (at most MAX_ENUM_CHARS)
+    bool complete;     // every character was read and the sizes added up
+    CharSummary c[MAX_ENUM_CHARS];
+};
+
+// The last character the client asked to create (CMSG_CHAR_CREATE).
+struct CharCreate {
+    uint32_t tick;
+    bool valid;
+    CharSummary c;
+    uint8_t outfit;
+};
+
+// Both read only inside [data, data + size); false when the packet is too short or malformed.
+bool ParseCharEnum(const uint8_t* data, size_t size, CharList* out);
+bool ParseCharCreate(const uint8_t* data, size_t size, CharCreate* out);
+
+// One writer (the game's network code on the main thread), one reader at crash time.
+template <class T>
+struct Latest {
+    uint32_t seq;  // odd while it is being written
+    T v;
+
+    void Store(const T& value) {
+        uint32_t s = __atomic_load_n(&seq, __ATOMIC_RELAXED);
+        __atomic_store_n(&seq, s + 1, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        v = value;
+        __atomic_store_n(&seq, s + 2, __ATOMIC_RELEASE);
+    }
+    // False when nothing was stored yet or it was being written right then.
+    bool Load(T* out) const {
+        uint32_t before = __atomic_load_n(&seq, __ATOMIC_ACQUIRE);
+        if (before == 0 || (before & 1)) return false;
+        *out = v;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        return __atomic_load_n(&seq, __ATOMIC_RELAXED) == before;
+    }
+};
+
+struct DbcCount {
+    const char* name;   // "ChrRaces"
+    bool ok;            // could be read
+    uint32_t records;
+    int32_t maxId;
+};
+
+// Game state read at crash time from fixed Wow.exe 12340 addresses (see win_main.cpp).
+struct GameState {
+    bool valid;
+    DbcCount dbc[MAX_DBC_COUNTS];
+    unsigned dbcCount;
+    // character creation (CCharacterCreation)
+    bool createOk;
+    uint32_t raceIndex;        // m_raceIndex
+    uint32_t character;        // m_character
+    uint32_t customizeFrame;   // m_charCustomizeFrame
+    uint32_t raceCount;        // m_races.m_count
+    int32_t races[MAX_CREATE_RACES];
+    unsigned racesRead;
+    unsigned prefsSet;         // non-null entries of m_charPreferences[22][2]
+    // reputation (CGReputationInfo)
+    bool repOk;
+    uint32_t numHeaders;       // m_numHeaders (the array holds 64)
+    unsigned nullHeaders;      // null pointers in m_headers[0..63] (all are set at start)
+    // the last character list and create request
+    bool haveList;
+    CharList list;
+    bool haveCreate;
+    CharCreate create;
+};
+
+void FormatGameState(Buf& b, const GameState& g, uint32_t now);
+
 // ---- what goes in a report ----
 
 struct Module {
@@ -196,6 +292,7 @@ struct CrashInfo {
     unsigned moduleCount;
     const FileEntry* files;
     unsigned fileCount;
+    const GameState* game;    // null when it could not be read
 };
 
 // "0x0063A1B2 Wow.exe+0x23A1B2 NetClient::ProcessMessage+0x42"

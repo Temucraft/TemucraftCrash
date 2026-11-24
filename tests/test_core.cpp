@@ -141,6 +141,7 @@ static void TestRingSimple() {
 // many writers at once, a reader taking snapshots at the same time: every entry it sees must be whole
 struct WriterArg { int id; };
 static volatile int g_stop;
+static int g_writersDone;
 
 static void* Writer(void* p) {
     int id = static_cast<WriterArg*>(p)->id;
@@ -148,6 +149,7 @@ static void* Writer(void* p) {
         uint32_t v = (static_cast<uint32_t>(id) << 24) | (i & 0xFFFFFF);
         g_ring.Push(v, v, v ^ 0xA5A5A5A5u);
     }
+    __atomic_add_fetch(&g_writersDone, 1, __ATOMIC_RELEASE);
     return nullptr;
 }
 
@@ -160,7 +162,8 @@ static void TestRingThreads() {
     }
     PacketEntry out[64];
     unsigned torn = 0, seen = 0;
-    for (int k = 0; k < 20000; k++) {
+    // read until every writer is done (a fixed number of reads could all happen before the writers start)
+    for (int k = 0; k < 20000 || __atomic_load_n(&g_writersDone, __ATOMIC_ACQUIRE) < 4; k++) {
         unsigned n = g_ring.Snapshot(out, 64);
         for (unsigned i = 0; i < n; i++) {
             seen++;
@@ -246,14 +249,57 @@ static void MakeSample(char* text, size_t size, bool print) {
     c.files = files;
     c.fileCount = 3;
 
-    PacketEntry in[3] = {{c.tick - 12, 0x17D, 312}, {c.tick - 450, 0x0A9, 1180}, {c.tick - 2010, 0x1DD, 8}};
-    PacketEntry out[2] = {{c.tick - 30, 0x17B, 8}, {c.tick - 3200, 0x0B5, 26}};
+    PacketEntry in[4] = {{c.tick - 12, 0x17D, 312, 0, {}}, {c.tick - 450, 0x0A9, 1180, 0, {}}, {c.tick - 2010, 0x1DD, 8, 0, {}},
+                         {c.tick - 2500, 0x122, 645, 16, {0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}};
+    PacketEntry out[2] = {{c.tick - 30, 0x17B, 8, 0, {}}, {c.tick - 3200, 0x0B5, 26, 0, {}}};
+
+    // the race and character section
+    static GameState g;
+    memset(&g, 0, sizeof(g));
+    g.valid = true;
+    g.dbc[0] = {"ChrRaces", true, 42, 213};
+    g.dbc[1] = {"CharSections", false, 0, 0};
+    g.dbcCount = 2;
+    g.createOk = true;
+    g.raceIndex = 3;
+    g.character = 0x1F000000;
+    g.customizeFrame = 0x1E000000;
+    g.raceCount = 12;
+    for (unsigned i = 0; i < 12; i++) g.races[i] = static_cast<int32_t>(i + 12);
+    g.racesRead = 12;
+    g.prefsSet = 2;
+    g.repOk = true;
+    g.numHeaders = 3;
+    g.nullHeaders = 1;
+    // a character list with one character, as the server sends it
+    static uint8_t list[300];
+    memset(list, 0, sizeof(list));
+    size_t at = 0;
+    list[at++] = 1;
+    at += 8;
+    memcpy(list + at, "Testname", 9);
+    at += 9;
+    const uint8_t look[9] = {24, 1, 0, 2, 3, 4, 5, 6, 80};
+    memcpy(list + at, look, 9);
+    at += 9 + 32 + 1 + 12 + 23 * 9;
+    CHECK(ParseCharEnum(list, at, &g.list) && g.list.complete && g.list.parsed == 1 && g.list.c[0].race == 24 && g.list.c[0].level == 80);
+    CharList shortList;
+    CHECK(!ParseCharEnum(list, 20, &shortList) && shortList.parsed == 0);
+    g.list.tick = c.tick - 60000;
+    g.haveList = true;
+    const uint8_t create[] = {'N', 'e', 'w', 0, 30, 2, 1, 0, 1, 2, 3, 4, 0};
+    CHECK(ParseCharCreate(create, sizeof(create), &g.create) && g.create.c.race == 30 && g.create.c.cls == 2);
+    CHECK(!ParseCharCreate(create, 6, &g.create));
+    CHECK(ParseCharCreate(create, sizeof(create), &g.create));
+    g.create.tick = c.tick - 5000;
+    g.haveCreate = true;
+    c.game = &g;
     TextEntry lua[1];
     lua[0].tick = c.tick - 65000;
     strcpy(lua[0].text, "Interface\\AddOns\\Foo\\Foo.lua:12: attempt to index global 'Bar' (a nil value)");
 
     Buf b(text, size);
-    FormatReport(b, c, in, 3, 1543, out, 2, 210, lua, 1, 1);
+    FormatReport(b, c, in, 4, 1543, out, 2, 210, lua, 1, 1);
     if (print) fputs(text, stdout);
 
     CHECK(Has(text, "Temucraft crash report"));
@@ -270,12 +316,25 @@ static void MakeSample(char* text, size_t size, bool print) {
     CHECK(Has(text, "ntdll.dll+0x5A1B0"));
     CHECK(Has(text, "Game ran for: 3723.456 s"));
     CHECK(Has(text, "Minidump: Temucraft-2026-11-24-210513.dmp"));
+    CHECK(Has(text, "(count 129, over the stock client's 128)"));
+    CHECK(Has(text, "ChrRaces.dbc"));
+    CHECK(Has(text, "42 records, highest id 213"));
+    CHECK(Has(text, "(could not read)"));
+    CHECK(Has(text, "race ids: 12 13 14"));
+    CHECK(Has(text, "m_charPreferences"));
+    CHECK(Has(text, "more than 10 races"));
+    CHECK(Has(text, "the header list is broken"));
+    CHECK(Has(text, "Testname"));
+    CHECK(Has(text, "race 24, class 1, gender 0"));
+    CHECK(Has(text, "past the stock client's 22-race arrays"));
+    CHECK(Has(text, "Last character create request"));
+    CHECK(Has(text, "race 30, class 2, gender 1"));
     CHECK(!b.full);
 
     // a small buffer: cut short but still a proper string
     static char tiny[300];
     Buf t(tiny, sizeof(tiny));
-    FormatReport(t, c, in, 3, 1543, out, 2, 210, lua, 1, 1);
+    FormatReport(t, c, in, 4, 1543, out, 2, 210, lua, 1, 1);
     CHECK(t.full && strlen(tiny) == sizeof(tiny) - 1);
 
     // a fatal error from the game, not an exception

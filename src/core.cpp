@@ -6,7 +6,7 @@ namespace tc {
 #include "../data/functions.inc"
 #include "../data/opcodes.inc"
 
-static const char kVersion[] = "1.0.0";
+static const char kVersion[] = "1.1.0";
 
 // ---- Buf ----
 
@@ -233,7 +233,230 @@ static void Packets(Buf& b, const char* title, const PacketEntry* e, unsigned co
         b.str(")");
         b.padTo(58);
         b.size(e[i].size);
+        if (e[i].headLen) {
+            b.padTo(72);
+            for (unsigned j = 0; j < e[i].headLen && j < HEAD_BYTES; j++) {
+                if (j) b.ch(' ');
+                b.hex(e[i].head[j], 2);
+            }
+            uint32_t v;
+            // the numbers that show a reputation list index past the stock 128 (CGReputationInfo::m_factionStandings)
+            if (e[i].opcode == 0x122 && e[i].headLen >= 4) {  // SMSG_INITIALIZE_FACTIONS: count
+                v = static_cast<uint32_t>(e[i].head[0]) | (static_cast<uint32_t>(e[i].head[1]) << 8) |
+                    (static_cast<uint32_t>(e[i].head[2]) << 16) | (static_cast<uint32_t>(e[i].head[3]) << 24);
+                b.str("  (count ");
+                b.dec(v);
+                b.str(v > 128 ? ", over the stock client's 128)" : ")");
+            } else if (e[i].opcode == 0x124 && e[i].headLen >= 13) {  // SMSG_SET_FACTION_STANDING: first list index
+                v = static_cast<uint32_t>(e[i].head[9]) | (static_cast<uint32_t>(e[i].head[10]) << 8) |
+                    (static_cast<uint32_t>(e[i].head[11]) << 16) | (static_cast<uint32_t>(e[i].head[12]) << 24);
+                b.str("  (first list index ");
+                b.dec(v);
+                b.str(v > 127 ? ", past the stock client's 127)" : ")");
+            }
+        }
         b.nl();
+    }
+}
+
+// ---- characters and races ----
+
+namespace {
+struct Reader {
+    const uint8_t* p;
+    size_t n;
+    size_t at;
+    bool ok;
+    bool Skip(size_t k) {
+        if (!ok || k > n - at) return ok = false;
+        at += k;
+        return true;
+    }
+    uint8_t U8() {
+        if (!ok || at >= n) {
+            ok = false;
+            return 0;
+        }
+        return p[at++];
+    }
+    // copies a 0-terminated string (cut to cap - 1 chars); fails when there is no 0 before the end
+    bool Str(char* out, size_t cap) {
+        size_t k = 0;
+        while (ok) {
+            if (at >= n) return ok = false;
+            char c = static_cast<char>(p[at++]);
+            if (!c) break;
+            if (k + 1 < cap) out[k++] = (c == '\r' || c == '\n' || c == '\t') ? ' ' : c;
+        }
+        if (cap) out[k < cap ? k : cap - 1] = 0;
+        return ok;
+    }
+};
+}  // namespace
+
+bool ParseCharEnum(const uint8_t* data, size_t size, CharList* out) {
+    if (!out) return false;
+    out->count = 0;
+    out->parsed = 0;
+    out->complete = false;
+    if (!data) return false;
+    Reader r = {data, size, 0, true};
+    out->count = r.U8();
+    if (!r.ok) return false;
+    for (unsigned i = 0; i < out->count; i++) {
+        CharSummary s;
+        s.name[0] = 0;
+        r.Skip(8);  // guid
+        r.Str(s.name, sizeof(s.name));
+        s.race = r.U8();
+        s.cls = r.U8();
+        s.gender = r.U8();
+        s.skin = r.U8();
+        s.face = r.U8();
+        s.hairStyle = r.U8();
+        s.hairColor = r.U8();
+        s.facialHair = r.U8();
+        s.level = r.U8();
+        // zone, map, x, y, z, guild, flags, customize flags (8 x 4), first login (1), pet display, level, family
+        // (3 x 4), then 23 equipment slots of display id (4), inventory type (1), enchant (4)
+        r.Skip(32 + 1 + 12 + 23 * 9);
+        if (!r.ok) return out->parsed > 0;
+        if (out->parsed < MAX_ENUM_CHARS) out->c[out->parsed++] = s;
+    }
+    out->complete = r.at == size;
+    return true;
+}
+
+bool ParseCharCreate(const uint8_t* data, size_t size, CharCreate* out) {
+    if (!out) return false;
+    out->valid = false;
+    if (!data) return false;
+    Reader r = {data, size, 0, true};
+    CharSummary& s = out->c;
+    s.name[0] = 0;
+    r.Str(s.name, sizeof(s.name));
+    s.race = r.U8();
+    s.cls = r.U8();
+    s.gender = r.U8();
+    s.skin = r.U8();
+    s.face = r.U8();
+    s.hairStyle = r.U8();
+    s.hairColor = r.U8();
+    s.facialHair = r.U8();
+    out->outfit = r.U8();
+    s.level = 0;
+    out->valid = r.ok;
+    return r.ok;
+}
+
+static void CharLine(Buf& b, const CharSummary& s, bool showLevel) {
+    b.str("    ");
+    b.str(s.name);
+    b.padTo(22);
+    b.str("race ");
+    b.dec(s.race);
+    b.str(", class ");
+    b.dec(s.cls);
+    b.str(", gender ");
+    b.dec(s.gender);
+    b.str(", skin ");
+    b.dec(s.skin);
+    b.str(" face ");
+    b.dec(s.face);
+    b.str(" hair ");
+    b.dec(s.hairStyle);
+    b.ch('/');
+    b.dec(s.hairColor);
+    b.str(" facial ");
+    b.dec(s.facialHair);
+    if (showLevel) {
+        b.str(", level ");
+        b.dec(s.level);
+    }
+    if (s.race >= 32) b.str("  [race id 32 or more: 32-bit race masks can't hold it]");
+    else if (s.race >= 22) b.str("  [race id 22 or more: past the stock client's 22-race arrays]");
+    b.nl();
+}
+
+void FormatGameState(Buf& b, const GameState& g, uint32_t now) {
+    b.nl();
+    b.line("Races and characters (read from the game at the crash):");
+    if (!g.valid) {
+        b.line("  (not read)");
+        return;
+    }
+    for (unsigned i = 0; i < g.dbcCount && i < MAX_DBC_COUNTS; i++) {
+        const DbcCount& d = g.dbc[i];
+        b.str("  ");
+        b.str(d.name);
+        b.str(".dbc");
+        b.padTo(32);
+        if (!d.ok) {
+            b.line("(could not read)");
+            continue;
+        }
+        b.dec(d.records);
+        b.str(" records, highest id ");
+        b.sdec(d.maxId);
+        b.nl();
+    }
+    if (g.createOk) {
+        b.str("  Character creation: ");
+        b.dec(g.raceCount);
+        b.str(" races, selected index ");
+        if (g.raceIndex == 0xFFFFFFFFu) b.str("none");
+        else b.dec(g.raceIndex);
+        b.str(", model ");
+        b.hex0x(g.character);
+        b.str(", frame ");
+        b.hex0x(g.customizeFrame);
+        b.str(", saved choices ");
+        b.dec(g.prefsSet);
+        b.line(" of 44");
+        if (g.racesRead) {
+            b.str("    race ids:");
+            bool past = false;
+            for (unsigned i = 0; i < g.racesRead && i < MAX_CREATE_RACES; i++) {
+                b.ch(' ');
+                b.sdec(g.races[i]);
+                if (g.races[i] >= 22) past = true;
+            }
+            b.nl();
+            if (past) b.line("    NOTE: a race id of 22 or more is in the list; the stock client keeps choices per race in a 22-race array (CCharacterCreation::m_charPreferences, 0x00B6B0D0), so it writes over the values after it");
+        }
+        if (g.raceIndex != 0xFFFFFFFFu && g.raceCount && g.raceIndex >= g.raceCount)
+            b.line("    NOTE: the selected race index is past the race list (overwritten?)");
+        if (g.raceCount > 10)
+            b.line("    NOTE: more than 10 races: GetAvailableRaces pushes 3 values per race without lua_checkstack (stock Lua gives a C function 20 slots)");
+    }
+    if (g.repOk) {
+        b.str("  Reputation headers: ");
+        b.dec(g.numHeaders);
+        b.str(" in use of 64, ");
+        b.dec(g.nullHeaders);
+        b.line(" null");
+        if (g.numHeaders > 64 || g.nullHeaders)
+            b.line("    NOTE: the header list is broken; a reputation list index past 127 writes over it (CGReputationInfo::m_factionStandings[128], 0x00C22B70)");
+    }
+    if (g.haveList) {
+        b.str("  Last character list (-");
+        b.seconds(now - g.list.tick);
+        b.str(" s): ");
+        b.dec(g.list.count);
+        b.str(" characters");
+        if (!g.list.complete) b.str(", could not read it all");
+        b.nl();
+        for (unsigned i = 0; i < g.list.parsed && i < MAX_ENUM_CHARS; i++) CharLine(b, g.list.c[i], true);
+    } else {
+        b.line("  Last character list: (none seen)");
+    }
+    if (g.haveCreate && g.create.valid) {
+        b.str("  Last character create request (-");
+        b.seconds(now - g.create.tick);
+        b.str(" s), outfit ");
+        b.dec(g.create.outfit);
+        b.line(":");
+        CharLine(b, g.create.c, false);
     }
 }
 
@@ -359,6 +582,8 @@ void FormatReport(Buf& b, const CrashInfo& c,
         b.str(" s  ");
         b.line(lua[i].text);
     }
+
+    if (c.game) FormatGameState(b, *c.game, c.tick);
 
     b.nl();
     b.str("Game files (");

@@ -71,6 +71,28 @@ static const uint32_t kLuaType = 0x0084DEB0;
 static const uint32_t kLuaToLString = 0x0084E0E0;
 
 static const uint32_t CMSG_MESSAGECHAT = 0x095;
+static const uint32_t SMSG_CHAR_ENUM = 0x03B;
+static const uint32_t CMSG_CHAR_CREATE = 0x036;
+
+// Game data read at crash time (only read, never written; each read goes through SafeRead).
+// WowClientDB<T> (WoW/Source/DB/WowClientDB.h): m_numRecords at +0x08, m_maxID at +0x0C. The bases are the
+// // STATIC: tags of WoW/Source/DB/DBClient/DBClient.cpp; the +0x08/+0x0C reads were seen in Wow.exe's own code
+// (ChrRaces 0x00AD3434 in Script_GetAvailableRaces 0x004E1880, TalentTab 0x00AD4B88 in BuildTabInfo 0x005C64D0).
+static const struct { const char* name; uint32_t base; } kDbcs[] = {
+    {"ChrRaces", 0x00AD3428},     {"ChrClasses", 0x00AD3404}, {"CharBaseInfo", 0x00AD32E4},
+    {"CharSections", 0x00AD332C}, {"Faction", 0x00AD3860},    {"FactionTemplate", 0x00AD3884},
+    {"EmotesTextSound", 0x00AD37AC}, {"TalentTab", 0x00AD4B80},
+};
+// CCharacterCreation (WoW/Source/Glue/CharacterCreation.cpp)
+static const uint32_t kCharPreferences = 0x00B6B0D0;  // CharacterPreferences* [22][2]
+static const uint32_t kRaceIndex = 0x00B6B180;
+static const uint32_t kCustomizeFrame = 0x00B6B184;
+static const uint32_t kCharacter = 0x00B6B1A0;
+static const uint32_t kRacesCount = 0x00B6B1D0;       // m_races (TSGrowableArray<int32_t> at 0x00B6B1CC): m_count
+static const uint32_t kRacesData = 0x00B6B1D4;        // m_data
+// CGReputationInfo (WoW/Source/Ui/ReputationInfo.cpp)
+static const uint32_t kRepHeaders = 0x00C23370;       // FactionHeader* [64]
+static const uint32_t kRepNumHeaders = 0x00C23470;
 
 // CDataStore (Engine/Source/Base/CDataStore.h)
 struct DataStore {
@@ -99,6 +121,8 @@ static char g_hooks[160];
 static PacketRing<64> g_in;
 static PacketRing<32> g_out;
 static TextRing<8> g_lua;
+static Latest<CharList> g_charList;
+static Latest<CharCreate> g_charCreate;
 
 // ---------------------------------------------------------------------------------------------------------------
 // small helpers
@@ -256,8 +280,19 @@ static int __fastcall h_ProcessMessage(void* self, void* /*edx*/, uint32_t time,
     const DataStore* m = static_cast<const DataStore*>(msg);
     if (m && m->data && m->read >= m->base && m->read + 2 <= m->size) {
         uint16_t opcode;
-        memcpy(&opcode, m->data + (m->read - m->base), 2);
-        g_in.Push(GetTickCount(), opcode, m->size - m->read - 2);
+        const uint8_t* at = m->data + (m->read - m->base);
+        memcpy(&opcode, at, 2);
+        const uint8_t* body = at + 2;
+        uint32_t bodySize = m->size - m->read - 2;
+        DWORD now = GetTickCount();
+        g_in.Push(now, opcode, bodySize, body, bodySize < static_cast<uint32_t>(HEAD_BYTES) ? bodySize : static_cast<uint32_t>(HEAD_BYTES));
+        if (opcode == SMSG_CHAR_ENUM) {
+            static CharList list;  // server packets come in on the main thread only
+            if (ParseCharEnum(body, bodySize, &list)) {
+                list.tick = now;
+                g_charList.Store(list);
+            }
+        }
     }
     return o_ProcessMessage(self, time, msg, a4);
 }
@@ -269,6 +304,13 @@ static void __fastcall h_NetSend(void* self, void* /*edx*/, void* msg) {
         uint32_t opcode;
         memcpy(&opcode, at, 4);
         g_out.Push(GetTickCount(), opcode, m->size - m->read - 4);
+        if (opcode == CMSG_CHAR_CREATE) {
+            static CharCreate create;
+            if (ParseCharCreate(at + 4, m->size - m->read - 4, &create)) {
+                create.tick = GetTickCount();
+                g_charCreate.Store(create);
+            }
+        }
         if (g_testMode && opcode == CMSG_MESSAGECHAT) {
             char kind[16];
             if (FindTestMarker(at, m->size - m->read, kind, sizeof(kind))) RunCrashTest(kind);
@@ -683,6 +725,40 @@ static void LoadFiles() {
     }
 }
 
+static GameState g_game;
+
+static void ReadGameState(GameState& g) {
+    memset(&g, 0, sizeof(g));
+    if (!g_buildOk) return;
+    g.valid = true;
+    for (const auto& d : kDbcs) {
+        if (g.dbcCount >= MAX_DBC_COUNTS) break;
+        DbcCount& e = g.dbc[g.dbcCount++];
+        e.name = d.name;
+        uint32_t v[2];
+        e.ok = SafeRead(d.base + 8, v, sizeof(v));
+        e.records = e.ok ? v[0] : 0;
+        e.maxId = e.ok ? static_cast<int32_t>(v[1]) : 0;
+    }
+    uint32_t count = 0, data = 0;
+    g.createOk = SafeRead(kRaceIndex, &g.raceIndex, 4) && SafeRead(kCustomizeFrame, &g.customizeFrame, 4) &&
+                 SafeRead(kCharacter, &g.character, 4) && SafeRead(kRacesCount, &count, 4) && SafeRead(kRacesData, &data, 4);
+    if (g.createOk) {
+        g.raceCount = count;
+        unsigned want = count < static_cast<uint32_t>(MAX_CREATE_RACES) ? count : static_cast<uint32_t>(MAX_CREATE_RACES);
+        if (data && want && SafeRead(data, g.races, want * 4)) g.racesRead = want;
+        uint32_t prefs[44];
+        if (SafeRead(kCharPreferences, prefs, sizeof(prefs)))
+            for (uint32_t p : prefs) g.prefsSet += p != 0;
+    }
+    uint32_t headers[64];
+    g.repOk = SafeRead(kRepNumHeaders, &g.numHeaders, 4) && SafeRead(kRepHeaders, headers, sizeof(headers));
+    if (g.repOk)
+        for (uint32_t h : headers) g.nullHeaders += h == 0;
+    g.haveList = g_charList.Load(&g.list);
+    g.haveCreate = g_charCreate.Load(&g.create);
+}
+
 static void Two(Buf& b, unsigned v) {
     b.ch(static_cast<char>('0' + (v / 10) % 10));
     b.ch(static_cast<char>('0' + v % 10));
@@ -812,6 +888,9 @@ static void WriteReport() {
     unsigned inN = g_in.Snapshot(g_inCopy, 64);
     unsigned outN = g_out.Snapshot(g_outCopy, 32);
     unsigned luaN = g_lua.Snapshot(g_luaCopy, 8);
+
+    ReadGameState(g_game);
+    c.game = &g_game;
 
     Buf b(g_text, sizeof(g_text) - 256);
     FormatReport(b, c, g_inCopy, inN, g_in.Total(), g_outCopy, outN, g_out.Total(), g_luaCopy, luaN, g_lua.Total());

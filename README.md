@@ -16,6 +16,11 @@ The report has:
 - the last 64 server packets received and the last 32 client packets sent: opcode name, number, size and how long
   before the crash
 - the last 8 Lua errors
+- for server packets, the first 16 bytes after the opcode; for `SMSG_INITIALIZE_FACTIONS` the count and for
+  `SMSG_SET_FACTION_STANDING` the first reputation list index are spelled out, with a note when they are past the
+  stock client's 128 slots (`CGReputationInfo::m_factionStandings[128]` at 0x00C22B70; a higher index writes over
+  `m_headers[64]` at 0x00C23370 and crashes later in `CGReputationInfo::AddHeader` 0x005CFE70)
+- races and characters (see "Race data in the report" below)
 - the client build and which hooks were on
 - the patch list (`Data\*.MPQ` and `Data\<locale>\*.MPQ`, names and sizes)
 - the loaded DLLs (address range and full path)
@@ -23,6 +28,25 @@ The report has:
 
 The game's own fatal errors that are not exceptions (the error box, "ERROR #134 Fatal condition") are reported too,
 with the game's message.
+
+## Race data in the report
+
+Added for the crashes with the extra races. Nothing here hooks anything new: at crash time the writer only reads
+fixed Wow.exe 12340 addresses with `ReadProcessMemory` (a bad pointer gives "could not read", never a second crash),
+and the two packet hooks above parse two packets into fixed buffers.
+
+- DBC sizes: records and highest id of ChrRaces, ChrClasses, CharBaseInfo, CharSections, Faction,
+  FactionTemplate, EmotesTextSound and TalentTab (`WowClientDB<T>`: `m_numRecords` +0x08, `m_maxID` +0x0C, bases
+  from the `// STATIC:` tags in `WoW/Source/DB/DBClient/DBClient.cpp`)
+- character creation (`CCharacterCreation`): the race ids in `m_races` (0x00B6B1CC), `m_raceIndex` (0x00B6B180),
+  `m_character` (0x00B6B1A0), `m_charCustomizeFrame` (0x00B6B184) and how many of the 44 `m_charPreferences[22][2]`
+  (0x00B6B0D0) are set. A note is added when a race id of 22 or more is in the list (that array then writes over
+  the values after it) or when there are more than 10 races (`Script_GetAvailableRaces` 0x004E1880 pushes 3 Lua
+  values per race with no `lua_checkstack`)
+- reputation headers: `m_numHeaders` (0x00C23470) and null pointers in `m_headers[64]`
+- the last character list (`SMSG_CHAR_ENUM`): name, race, class, gender, skin, face, hair, facial hair and level
+  of each character (up to 12)
+- the last create request (`CMSG_CHAR_CREATE`): the same, plus the outfit
 
 ## How it loads
 
@@ -127,7 +151,7 @@ On Linux (the build was made in a container with Ubuntu's `g++-mingw-w64-i686`):
     ./build.sh
 
 It runs the tests (`tests/test_core.cpp`: text formatting, name lookups, ring buffers with 4 threads writing while
-one reads, the test marker, the return address check, a whole sample report), builds `build/version.dll` and checks
+one reads, the test marker, the return address check, the character list and create parsers, a whole sample report), builds `build/version.dll` and checks
 it (`tools/check_pe.sh`: 32-bit x86 DLL, the 17 version.dll exports and nothing else, imports only kernel32 and
 msvcrt). `./build/test_core --sample` prints a sample report.
 
