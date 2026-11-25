@@ -167,3 +167,19 @@ msvcrt). `./build/test_core --sample` prints a sample report.
 - `src/win_main.cpp`: start-up, hooks, exception handling, the report writer, the minidump
 - `src/proxy.s`, `src/version.def`: the version.dll exports
 - `tools/gen_data.py`, `tools/check_pe.sh`, `tests/test_core.cpp`, `build.sh`
+
+## 1.2.0: debug mode and Lua functions (2026-11-25)
+
+- **Debug mode** (`TemucraftDebug.txt` in the game folder; the launcher's "Debug mode" option puts it there): every
+  Lua error, from the game and from the login and character screens, goes to `Logs\TemucraftDebug.log` with the time.
+  With `TemucraftDebug-packets.txt` too, every server and client packet is logged by name and size (buffered, written
+  in blocks). Each game start adds a header line with the hook state. Off by default; no file, no log.
+- **Lua functions** (registered with the game's own `FrameScript_RegisterFunction` 0x00817F90 right after
+  `LoadScriptFunctions` 0x005120E0, by pointing its only call at 0x0052AB16 to our function, so they come back after
+  every /reload; only installed when the call and the functions have the 12340 bytes):
+  - `TemucraftCopyText(text)`: puts the text on the Windows clipboard (UTF-8 to UTF-16, up to 4 MB).
+  - `TemucraftDebugLog(text)`: adds a line to `Logs\TemucraftDebug.log` while debug mode is on.
+  - Addons must check they exist first (`if TemucraftCopyText then ... end`): players without this file, or with
+    it off, don't have them.
+- The report's Hooks line now also says "Lua functions on/off" and "DEBUG MODE".
+- user32 functions (clipboard) are looked up with GetProcAddress, so the import list stays kernel32 and msvcrt.

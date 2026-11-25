@@ -116,7 +116,7 @@ static DWORD g_exeStamp;
 static bool g_buildOk;
 static wchar_t g_gameDir[MAX_PATH];
 static wchar_t g_exePath[MAX_PATH];
-static char g_hooks[160];
+static char g_hooks[256];
 
 static PacketRing<64> g_in;
 static PacketRing<32> g_out;
@@ -263,6 +263,166 @@ __attribute__((noinline)) static void RunCrashTest(const char* kind) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// debug mode (TemucraftDebug.txt in the game folder): Lua errors (game and login screens) and, with
+// TemucraftDebug-packets.txt too, every packet by name go to Logs\TemucraftDebug.log. Off by default.
+
+static bool g_debug;
+static bool g_debugPackets;
+static wchar_t g_debugLog[MAX_PATH];
+static CRITICAL_SECTION g_debugLock;
+static bool g_debugLockOk;
+static char g_packetBuf[32768];
+static size_t g_packetLen;
+
+static void DebugAppend(const char* data, size_t size) {
+    HANDLE h = CreateFileW(g_debugLog, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(h, data, static_cast<DWORD>(size), &written, nullptr);
+    CloseHandle(h);
+}
+
+static void DebugStamp(Buf& b) {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    b.ch('[');
+    b.ch(static_cast<char>('0' + t.wHour / 10)); b.ch(static_cast<char>('0' + t.wHour % 10)); b.ch(':');
+    b.ch(static_cast<char>('0' + t.wMinute / 10)); b.ch(static_cast<char>('0' + t.wMinute % 10)); b.ch(':');
+    b.ch(static_cast<char>('0' + t.wSecond / 10)); b.ch(static_cast<char>('0' + t.wSecond % 10)); b.str("] ");
+}
+
+static void DebugFlushPackets() {
+    if (g_packetLen) {
+        DebugAppend(g_packetBuf, g_packetLen);
+        g_packetLen = 0;
+    }
+}
+
+// one line: "[hh:mm:ss] kind: text" (text cut at 1000 characters, line breaks kept)
+static void DebugLine(const char* kind, const char* text, size_t len) {
+    if (!g_debug || !g_debugLockOk) return;
+    char line[1100];
+    Buf b(line, sizeof(line));
+    DebugStamp(b);
+    b.str(kind);
+    b.str(": ");
+    b.strn(text, len < 1000 ? len : 1000);
+    b.nl();
+    EnterCriticalSection(&g_debugLock);
+    DebugFlushPackets();   // keep the order of lines
+    DebugAppend(line, b.len);
+    LeaveCriticalSection(&g_debugLock);
+}
+
+static void DebugPacket(bool fromServer, uint32_t opcode, uint32_t size) {
+    if (!g_debugPackets || !g_debugLockOk) return;
+    char line[128];
+    Buf b(line, sizeof(line));
+    DebugStamp(b);
+    b.str(fromServer ? "S> " : "C> ");
+    const char* name = OpcodeName(opcode);
+    b.str(name ? name : "?");
+    b.str(" (");
+    b.hex0x(opcode, 3);
+    b.str(") ");
+    b.dec(size);
+    b.nl();
+    EnterCriticalSection(&g_debugLock);
+    if (g_packetLen + b.len > sizeof(g_packetBuf)) DebugFlushPackets();
+    memcpy(g_packetBuf + g_packetLen, line, b.len);
+    g_packetLen += b.len;
+    LeaveCriticalSection(&g_debugLock);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Lua functions the game doesn't have, registered with the game's own FrameScript_RegisterFunction (0x00817F90)
+// right after LoadScriptFunctions (0x005120E0), so they come back after every /reload:
+//   TemucraftCopyText(text)  puts the text on the Windows clipboard (for the error log window)
+//   TemucraftDebugLog(text)  adds a line to Logs\TemucraftDebug.log while debug mode is on
+// Addons must check that they exist (players without this file, or with it turned off, don't have them).
+
+static const uint32_t kRegisterFunction = 0x00817F90;
+static const uint32_t kLoadScriptFunctions = 0x005120E0;
+static const uint32_t kLoadScriptFunctionsCall = 0x0052AB16;   // the only call, in CGGameUI::InitializeFrameXML
+typedef int(__cdecl* lua_CFunction_t)(void*);
+typedef void(__cdecl* RegisterFunction_t)(const char*, lua_CFunction_t);
+typedef const char*(__cdecl* lua_tolstring_t2)(void*, int, size_t*);
+static bool g_luaFunctions;
+
+static void CopyToClipboard(const char* text, size_t len) {
+    HMODULE user = GetModuleHandleW(L"user32.dll");
+    if (!user) return;
+    typedef BOOL(WINAPI * Open_t)(HWND);
+    typedef BOOL(WINAPI * Empty_t)();
+    typedef HANDLE(WINAPI * Set_t)(UINT, HANDLE);
+    typedef BOOL(WINAPI * Close_t)();
+    Open_t open = reinterpret_cast<Open_t>(GetProcAddress(user, "OpenClipboard"));
+    Empty_t empty = reinterpret_cast<Empty_t>(GetProcAddress(user, "EmptyClipboard"));
+    Set_t set = reinterpret_cast<Set_t>(GetProcAddress(user, "SetClipboardData"));
+    Close_t close = reinterpret_cast<Close_t>(GetProcAddress(user, "CloseClipboard"));
+    if (!open || !empty || !set || !close) return;
+    if (len > 4 * 1024 * 1024) len = 4 * 1024 * 1024;
+    int wide = MultiByteToWideChar(CP_UTF8, 0, text, static_cast<int>(len), nullptr, 0);
+    if (wide <= 0) return;
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (static_cast<SIZE_T>(wide) + 1) * sizeof(wchar_t));
+    if (!mem) return;
+    wchar_t* w = static_cast<wchar_t*>(GlobalLock(mem));
+    if (!w) { GlobalFree(mem); return; }
+    MultiByteToWideChar(CP_UTF8, 0, text, static_cast<int>(len), w, wide);
+    w[wide] = 0;
+    GlobalUnlock(mem);
+    if (!open(nullptr)) { GlobalFree(mem); return; }
+    empty();
+    if (!set(13 /* CF_UNICODETEXT */, mem)) GlobalFree(mem);   // on success the clipboard owns the memory
+    close();
+}
+
+static int __cdecl Lua_CopyText(void* L) {
+    size_t len = 0;
+    const char* text = reinterpret_cast<lua_tolstring_t2>(0x0084E0E0)(L, 1, &len);
+    if (text && len) CopyToClipboard(text, len);
+    return 0;
+}
+
+static int __cdecl Lua_DebugLog(void* L) {
+    size_t len = 0;
+    const char* text = reinterpret_cast<lua_tolstring_t2>(0x0084E0E0)(L, 1, &len);
+    if (text && len) DebugLine("Addon", text, len);
+    return 0;
+}
+
+static void __cdecl h_LoadScriptFunctions() {
+    reinterpret_cast<void(__cdecl*)()>(kLoadScriptFunctions)();
+    RegisterFunction_t reg = reinterpret_cast<RegisterFunction_t>(kRegisterFunction);
+    reg("TemucraftCopyText", Lua_CopyText);
+    reg("TemucraftDebugLog", Lua_DebugLog);
+}
+
+// points the one call to LoadScriptFunctions at h_LoadScriptFunctions (only when the call and both functions look
+// like the 12340 client's)
+static bool InstallLuaFunctions() {
+    static const uint8_t call[] = {0xE8, 0xC5, 0x75, 0xFE, 0xFF};
+    static const uint8_t reg[] = {0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x0C, 0x56};
+    static const uint8_t load[] = {0x56, 0xE8};
+    static const uint8_t tolstring[] = {0x55, 0x8B, 0xEC, 0x56};
+    uint8_t a[5], b[7], c[2], d[4];
+    if (!SafeRead(kLoadScriptFunctionsCall, a, 5) || memcmp(a, call, 5) != 0) return false;
+    if (!SafeRead(kRegisterFunction, b, 7) || memcmp(b, reg, 7) != 0) return false;
+    if (!SafeRead(kLoadScriptFunctions, c, 2) || memcmp(c, load, 2) != 0) return false;
+    if (!SafeRead(0x0084E0E0, d, 4) || memcmp(d, tolstring, 4) != 0) return false;
+    uint8_t* at = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(kLoadScriptFunctionsCall));
+    int32_t rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&h_LoadScriptFunctions) - reinterpret_cast<uintptr_t>(at + 5));
+    DWORD old = 0;
+    if (!VirtualProtect(at + 1, 4, PAGE_EXECUTE_READWRITE, &old)) return false;
+    memcpy(at + 1, &rel, 4);
+    DWORD ignored;
+    VirtualProtect(at + 1, 4, old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), at, 5);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // detours (they only record, then call the game's own code)
 
 typedef int(__thiscall* ProcessMessage_t)(void*, uint32_t, void*, int);
@@ -286,6 +446,7 @@ static int __fastcall h_ProcessMessage(void* self, void* /*edx*/, uint32_t time,
         uint32_t bodySize = m->size - m->read - 2;
         DWORD now = GetTickCount();
         g_in.Push(now, opcode, bodySize, body, bodySize < static_cast<uint32_t>(HEAD_BYTES) ? bodySize : static_cast<uint32_t>(HEAD_BYTES));
+        DebugPacket(true, opcode, bodySize);
         if (opcode == SMSG_CHAR_ENUM) {
             static CharList list;  // server packets come in on the main thread only
             if (ParseCharEnum(body, bodySize, &list)) {
@@ -304,6 +465,7 @@ static void __fastcall h_NetSend(void* self, void* /*edx*/, void* msg) {
         uint32_t opcode;
         memcpy(&opcode, at, 4);
         g_out.Push(GetTickCount(), opcode, m->size - m->read - 4);
+        DebugPacket(false, opcode, m->size - m->read - 4);
         if (opcode == CMSG_CHAR_CREATE) {
             static CharCreate create;
             if (ParseCharCreate(at + 4, m->size - m->read - 4, &create)) {
@@ -323,7 +485,10 @@ static int __cdecl h_LuaHandleError(void* L) {
     if (L && reinterpret_cast<lua_type_t>(kLuaType)(L, -1) == 4 /* LUA_TSTRING */) {
         size_t len = 0;
         const char* text = reinterpret_cast<lua_tolstring_t>(kLuaToLString)(L, -1, &len);
-        if (text) g_lua.Push(GetTickCount(), text, len);
+        if (text) {
+            g_lua.Push(GetTickCount(), text, len);
+            DebugLine("Lua error", text, len);
+        }
     }
     return o_LuaHandleError(L);
 }
@@ -1023,6 +1188,22 @@ static void Start() {
     DWORD envLen = GetEnvironmentVariableA("TEMUCRAFT_CRASH_TEST", env, sizeof(env));
     g_testMode = FileExists(L"TemucraftCrash-test.txt") || (envLen == 1 && env[0] == '1');
 
+    // debug mode: Logs\TemucraftDebug.log (the launcher's Debug mode option puts TemucraftDebug.txt here)
+    if (FileExists(L"TemucraftDebug.txt")) {
+        wchar_t logs[MAX_PATH];
+        lstrcpynW(logs, g_gameDir, MAX_PATH);
+        if (lstrlenW(logs) + 40 < MAX_PATH) {
+            lstrcatW(logs, L"\\Logs");
+            CreateDirectoryW(logs, nullptr);
+            lstrcpyW(g_debugLog, logs);
+            lstrcatW(g_debugLog, L"\\TemucraftDebug.log");
+            InitializeCriticalSection(&g_debugLock);
+            g_debugLockOk = true;
+            g_debug = true;
+            g_debugPackets = FileExists(L"TemucraftDebug-packets.txt");
+        }
+    }
+
     g_go = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_go || !g_done) goto fail;
@@ -1058,6 +1239,7 @@ static void Start() {
                 Install(g_hookLua);
         }
         Install(g_hookFatal);
+        g_luaFunctions = InstallLuaFunctions();
         if (g_trampolines) {
             DWORD old;
             VirtualProtect(g_trampolines, 4096, PAGE_EXECUTE_READ, &old);
@@ -1069,9 +1251,23 @@ static void Start() {
         h.str(", Lua errors "); h.str(g_hookLua.on ? "on" : "OFF");
         h.str(", fatal errors "); h.str(g_hookFatal.on ? "on" : "OFF");
         h.str(", filter guard "); h.str(guard ? "on" : "OFF");
+        h.str(", Lua functions "); h.str(g_luaFunctions ? "on" : "OFF");
+        if (g_debug) h.str(g_debugPackets ? ", DEBUG MODE with packets" : ", DEBUG MODE");
         if (g_testMode) h.str(", TEST MODE");
     }
     g_active = true;
+    if (g_debug) {
+        char head[260];
+        Buf b(head, sizeof(head));
+        b.nl();
+        DebugStamp(b);
+        b.str("=== game started, TemucraftCrash hooks: ");
+        b.str(g_hooks);
+        b.nl();
+        EnterCriticalSection(&g_debugLock);
+        DebugAppend(head, b.len);
+        LeaveCriticalSection(&g_debugLock);
+    }
     return;
 
 fail:
@@ -1094,6 +1290,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     } else if (reason == DLL_PROCESS_DETACH) {
         // reserved != null: the game is closing. Crashes from here on are written on the crashing thread.
         g_exiting = true;
+        if (g_debugPackets && reserved) DebugFlushPackets();   // the game is closing: other threads are gone
         (void)reserved;
     }
     return TRUE;
