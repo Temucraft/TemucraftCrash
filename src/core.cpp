@@ -6,7 +6,7 @@ namespace tc {
 #include "../data/functions.inc"
 #include "../data/opcodes.inc"
 
-static const char kVersion[] = "1.1.0";
+static const char kVersion[] = "1.3.0";
 
 // ---- Buf ----
 
@@ -119,6 +119,8 @@ const char* OpcodeName(uint32_t opcode) {
     const char* n = kOpcodeNames[opcode];
     return n[0] ? n : nullptr;
 }
+
+const char* Version() { return kVersion; }
 
 const char* ExceptionName(uint32_t code) {
     switch (code) {

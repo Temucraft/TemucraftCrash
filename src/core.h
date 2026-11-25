@@ -47,6 +47,9 @@ const char* OpcodeName(uint32_t opcode);
 // "ACCESS_VIOLATION" for 0xC0000005; null when unknown.
 const char* ExceptionName(uint32_t code);
 
+// "1.3.0"
+const char* Version();
+
 // ---- ring buffers (lock free: many writers, one reader at crash time) ----
 
 enum { HEAD_BYTES = 16 };

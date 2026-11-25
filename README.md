@@ -150,7 +150,7 @@ On Linux (the build was made in a container with Ubuntu's `g++-mingw-w64-i686`):
 
     ./build.sh
 
-It runs the tests (`tests/test_core.cpp`: text formatting, name lookups, ring buffers with 4 threads writing while
+It runs the tests (`tests/test_perf.cpp`: the performance log's statistics, nesting, tables and lines; `tests/test_core.cpp`: text formatting, name lookups, ring buffers with 4 threads writing while
 one reads, the test marker, the return address check, the character list and create parsers, a whole sample report), builds `build/version.dll` and checks
 it (`tools/check_pe.sh`: 32-bit x86 DLL, the 17 version.dll exports and nothing else, imports only kernel32 and
 msvcrt). `./build/test_core --sample` prints a sample report.
@@ -164,9 +164,10 @@ msvcrt). `./build/test_core --sample` prints a sample report.
 ## Files
 
 - `src/core.h`, `src/core.cpp`: text, names, ring buffers, report layout (no Windows, no heap; tested on Linux)
+- `src/perf.h`, `src/perf.cpp`, `src/perf_win.inc`: the performance log (see 1.3.0 below)
 - `src/win_main.cpp`: start-up, hooks, exception handling, the report writer, the minidump
 - `src/proxy.s`, `src/version.def`: the version.dll exports
-- `tools/gen_data.py`, `tools/check_pe.sh`, `tests/test_core.cpp`, `build.sh`
+- `tools/gen_data.py`, `tools/check_pe.sh`, `tests/test_core.cpp`, `tests/test_perf.cpp`, `build.sh`
 
 ## 1.2.0: debug mode and Lua functions (2026-11-25)
 
@@ -183,3 +184,99 @@ msvcrt). `./build/test_core --sample` prints a sample report.
     it off, don't have them.
 - The report's Hooks line now also says "Lua functions on/off" and "DEBUG MODE".
 - user32 functions (clipboard) are looked up with GetProcAddress, so the import list stays kernel32 and msvcrt.
+
+## 1.3.0: performance log (2026-11-25)
+
+For finding what makes the game stutter, for example the lag when a race is clicked on the character create screen.
+
+**Turning it on.** It is on in debug mode (`TemucraftDebug.txt`, the launcher's "Debug mode" option), or with an
+empty `TemucraftPerf.txt` in the game folder (without debug mode). `TemucraftPerf-off.txt` turns it off even in debug
+mode. `TemucraftPerf.txt` may hold settings, one per line: `hitch=50` (a frame this many ms or longer is a hitch),
+`settle=33` (after a click, "smooth again" means 3 frames in a row shorter than this), `window=10` (a stats line every
+this many seconds). Without it on, none of the hooks below go in.
+
+**What `Logs\TemucraftPerf.log` shows** (times in ms; every line starts with the time of day):
+
+    === game started, TemucraftCrash 1.3.0 performance log: hitch 50.0 ms, smooth below 33.0 ms, stats every 10 s; 20 of 20 hooks on
+    [21:14:03.120] glue screen charcreate
+    [21:14:07.552] call SetSelectedRace(2) 95.0 ms: files 71.0, textures 9.0, character 13.0, own code 2.0
+    [21:14:07.570] HITCH 114.0 ms (frame 931, charcreate)
+      self ms: lua 3.0, files 71.0, textures 9.0, character 13.0, calls 2.0, other 16.0
+      lua 98.0 ms, 1 scripts: CharacterCreateRaceButton2:OnClick 98.0
+      files 71.0 ms, 4 opens/reads: Character\Orc\Male\OrcMale.m2 35.0, Character\Orc\Male\OrcMaleSkin00_00.blp 22.0, ...
+      textures 9.0 ms (1), models 0.0 ms (0): Character\Orc\Male\OrcMaleSkin00_00.blp 9.0
+      character build 93.0 ms (1 calls)
+      during: SetSelectedRace(2) 95.0 ms
+    [21:14:07.640]   after SetSelectedRace(2): next frame +112.0 ms, smooth again +160.0 ms (5 frames): 112.0* 48.0* 21.0 16.7 16.7
+    [21:14:13.001] stats 10.0 s: 591 frames, fps 59.1 avg, 51.9 worst second | frame ms p50 16.7, p95 16.7, max 114.0 | 1 hitch | time: files 0.7%, textures 0.1%, character 0.1% | charcreate
+
+- **stats** (every 10 s): frames, average fps and the fps of the worst second, frame time p50 / p95 / max, the
+  number of hitches, the share of the time spent in each kind of work, file work on other threads (background
+  loading), and the screen (`world` once no login screen ran in that window).
+- **HITCH** (a frame of 50 ms or more): "self ms" splits the frame into kinds of work without counting anything
+  twice (lua = Lua code itself; files = MPQ opens and reads; textures; models; character = the character model build;
+  calls = the timed character create functions' own code; present = drawing finished / waiting for the GPU; other =
+  everything not timed). Below it the inclusive times with the top 5 names: Lua handlers by frame name and script
+  (`TemucraftCharCreateFrame:OnUpdate`, `CharacterCreateFrame:OnEvent UPDATE_...`, `Parent.(unnamed):OnClick`), files
+  by name, textures and models by name, and which timed calls ran in that frame. Inclusive times can overlap (an
+  OnClick that loads files counts in both lua and files; a handler that runs another counts both).
+- **call**: `SetSelectedRace`, `SetSelectedSex`, `SetSelectedClass`, `CycleCharCustomization`,
+  `RandomizeCharCustomization`, `ResetCharCustomize` with their number arguments, how long they took and what in.
+  (3.3.5a has no `SetCharacterRace` / `SetCharacterGender`: the glue functions are `SetSelectedRace` / `SetSelectedSex`.)
+- **glue screen**: each `SetGlueScreen` (login, charselect, charcreate, ...).
+- **after ...**: after every call, glue screen, mark and span, the frames that follow until it is smooth again: the
+  first number is from the start of the interaction to the end of its frame, then each frame; `*` marks a slow one.
+  Interactions in the same frame share one line (`SetSelectedRace(3) + mark race click`).
+
+**Lua functions** for our own UI code (also at the login and character screens now; they do nothing while the log is
+off, and players without this DLL don't have them, so check first):
+
+    if TemucraftPerfMark then TemucraftPerfMark("race click") end      -- a line "mark race click", then "after mark ..."
+    if TemucraftPerfSpan then TemucraftPerfSpan("build preview") end   -- first call starts, the next with the same label ends:
+                                                                       -- "span build preview: 123.4 ms, 7 frames ended, 2 hitches"
+
+`TemucraftCopyText` and `TemucraftDebugLog` are now registered at the login screens too: the call of
+`CharacterCreateRegisterScriptFunctions` (0x004DFD00) at 0x004DA730 goes to our function, which calls it and adds
+ours (the glue Lua state is made again by CGlueMgr, so they come back each time).
+
+**Cost.** Off: nothing is installed. On: each timed function costs two `QueryPerformanceCounter` calls and a small
+table lookup on the frame thread (the thread that calls `GxScenePresent`); other threads only pass through (their file
+work is summed for the stats line). Nothing is written per call: lines are made at the end of a frame and only for
+hitches, interactions and the 10 s stats; they collect in memory and a thread of our own writes them out twice a
+second (also when the game closes).
+
+**Hooks** (all only in this mode; each checks its first bytes, the log's first line says which are on). Addresses from
+the wowdecomp `// OFFSET:` tags and the launcher's function list, bytes and calling conventions read from the Temucraft
+Wow.exe (`ret` sizes, callers' stack clean-up). None is in AzerothCore's `warden_checks` (the nearest, "Lua DoString"
+0x0081922E, is 0x13 bytes after the patched start of FrameScript_Execute(text)).
+
+| What | Address | Source | Bytes moved |
+|---|---|---|---|
+| `GxScenePresent()`: frame end | 0x00682A00 | `Engine/Source/Gx/Gx.cpp` | `55 8B EC 83 EC 0C` |
+| `FrameScript_Object::RunScript(script, argc, taint)` (thiscall): which script slot | 0x0081A2C0 | `Engine/Source/FrameScript/FrameScript_Object.cpp` | `55 8B EC 8B 45 10` |
+| `FrameScript_Execute(function, object, argc, taint, event)`: every handler and event | 0x00819EA0 | `Engine/Source/FrameScript/FrameScript.cpp` | `55 8B EC 83 EC 20` |
+| `FrameScript_Execute(source, file, taint)`: Lua text | 0x00819210 | same | `55 8B EC 51 83 05 A0 13 D4 00 01` |
+| `SFile::OpenEx(archive, name, flags, result)` (stdcall) | 0x00424B50 | `Engine/Source/BlizzardCore/SFile2-Core.cpp` | `55 8B EC 64 A1 00 00 00 00` |
+| `SFileReadFile(file, buffer, count, read, overlapped, unused)` (stdcall) | 0x00422530 | same | `55 8B EC 81 EC 00 01 00 00` |
+| `SFile::ReadFile(archive, name, data, size, extra, flags, overlapped)` (stdcall) | 0x00424E80 | same | `55 8B EC 8B 4D 1C` |
+| `TextureCreate(fileName, texFlags, status, flags)` | 0x004B9760 | `Engine/Source/Services/Texture.cpp` | `55 8B EC 81 EC 10 01 00 00` |
+| `TextureCacheCreateTexture(fileName)` | 0x004F3930 | function list | `55 8B EC 53 8B 5D 08` |
+| `CM2Scene::CreateModel(fileName, flags)` (thiscall) | 0x0081F8F0 | `Engine/Source/Model2/M2Scene.cpp` | `55 8B EC 8B 45 08` |
+| `CCharacterComponent::RenderPrep(a)` (thiscall) | 0x004F1520 | function list | `55 8B EC 56 8B F1` |
+| `CCharacterComponent::Init(a, b)` (thiscall) | 0x004F24D0 | function list | `55 8B EC 53 8B D9` |
+| `Script_SetSelectedRace` / `SetSelectedSex` / `SetSelectedClass` / `CycleCharCustomization` (Lua C functions) | 0x004E2470 / 0x004E1A60 / 0x004E1AC0 / 0x004E0B50 | `WoW/Source/Glue/CharacterCreation_Scripts.cpp` | `55 8B EC 83 EC 0C` / `55 8B EC 56 8B 75 08` / `55 8B EC 83 EC 0C` / `55 8B EC 83 EC 0C` |
+| `CCharacterCreation::RandomizeCharCustomization()` / `ResetCharCustomizeInfo()` (the Lua functions start with a relative call, so their callees) | 0x004E17F0 / 0x004E1FD0 | `WoW/Source/Glue/CharacterCreation.cpp` | `8B 0D A0 B1 B6 00 6A 00` / `55 8B EC A1 84 B1 B6 00` |
+| `CGlueMgr::SetScreen(name)` | 0x004D82A0 | `WoW/Source/Glue/CGlueMgr.cpp` | `55 8B EC 8B 45 08` |
+| `CGlueMgr::Idle(data, param)`: login screens are up | 0x004DAB40 | same | `55 8B EC 8B 0D 88 DF C5 00` |
+
+Names: a handler's frame name comes from the object's own `GetName()` (vtable slot 1, as
+`FrameScript_Object::GetDisplayName` 0x00482AA0 calls it; only when the vtable and the function are inside Wow.exe),
+for an unnamed frame its parent's (`CScriptRegion::m_parent` +0x94, read with `ReadProcessMemory`); made once per
+frame object and kept. The script comes from where `RunScript`'s `ScriptIx` sits in the object (`CSimpleFrame`
+`m_onUpdate` +0x144 and so on, from `Engine/Source/Frame/*.h`; unknown ones show as `script+0x...`), the event from
+`FrameScript_EventObject` +0x14. Reads by handle get the name the handle was opened with.
+
+**Files.** `src/perf.h`, `src/perf.cpp` (no Windows: frame statistics, nesting, tables, the lines; tested by
+`tests/test_perf.cpp`, `./build/test_perf --sample` prints a made-up session), `src/perf_win.inc` (the hooks, the log
+file and the writer thread; included into `win_main.cpp`). Copy diagnostics in the launcher adds the last 60 lines of
+`Logs\TemucraftPerf.log`.

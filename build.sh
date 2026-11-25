@@ -14,16 +14,18 @@ if [ -n "${FUNCTIONS_GZ:-}" ] && [ -n "${OPCODES_H:-}" ]; then
 fi
 
 echo "== tests (native)"
-g++ -O2 -std=c++17 -Wall -Wextra -pthread tests/test_core.cpp src/core.cpp -o build/test_core
+g++ -O2 -std=c++17 -Wall -Wextra -Werror -pthread tests/test_core.cpp src/core.cpp -o build/test_core
 ./build/test_core
+g++ -O2 -std=c++17 -Wall -Wextra -Werror tests/test_perf.cpp src/perf.cpp src/core.cpp -o build/test_perf
+./build/test_perf
 
 echo "== version.dll (32-bit Windows)"
 CXX=${CXX:-i686-w64-mingw32-g++}
-$CXX -O2 -std=c++17 -Wall -Wextra -Wno-cast-function-type -Wno-infinite-recursion \
+$CXX -O2 -std=c++17 -Wall -Wextra -Werror -Wno-cast-function-type -Wno-infinite-recursion \
     -fno-exceptions -fno-rtti -fno-asynchronous-unwind-tables \
     -shared -static -static-libgcc -static-libstdc++ -s \
     -Wl,--no-insert-timestamp -Wl,--enable-stdcall-fixup -Wl,--dynamicbase -Wl,--nxcompat \
-    -o build/version.dll src/win_main.cpp src/core.cpp src/proxy.s src/version.def
+    -o build/version.dll src/win_main.cpp src/core.cpp src/perf.cpp src/proxy.s src/version.def
 
 echo "== checks"
 sh tools/check_pe.sh build/version.dll

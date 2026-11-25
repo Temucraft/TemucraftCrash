@@ -349,6 +349,7 @@ typedef int(__cdecl* lua_CFunction_t)(void*);
 typedef void(__cdecl* RegisterFunction_t)(const char*, lua_CFunction_t);
 typedef const char*(__cdecl* lua_tolstring_t2)(void*, int, size_t*);
 static bool g_luaFunctions;
+static bool g_glueFunctions;
 
 static void CopyToClipboard(const char* text, size_t len) {
     HMODULE user = GetModuleHandleW(L"user32.dll");
@@ -392,11 +393,46 @@ static int __cdecl Lua_DebugLog(void* L) {
     return 0;
 }
 
-static void __cdecl h_LoadScriptFunctions() {
-    reinterpret_cast<void(__cdecl*)()>(kLoadScriptFunctions)();
+// the performance monitor's (perf_win.inc): they do nothing while it is off
+static int __cdecl Lua_PerfMark(void* L);
+static int __cdecl Lua_PerfSpan(void* L);
+
+static void RegisterOurFunctions() {
     RegisterFunction_t reg = reinterpret_cast<RegisterFunction_t>(kRegisterFunction);
     reg("TemucraftCopyText", Lua_CopyText);
     reg("TemucraftDebugLog", Lua_DebugLog);
+    reg("TemucraftPerfMark", Lua_PerfMark);
+    reg("TemucraftPerfSpan", Lua_PerfSpan);
+}
+
+static void __cdecl h_LoadScriptFunctions() {
+    reinterpret_cast<void(__cdecl*)()>(kLoadScriptFunctions)();
+    RegisterOurFunctions();
+}
+
+// The login screens have their own Lua state, set up again by CGlueMgr (FrameScript_Flush, then each
+// ...RegisterScriptFunctions). CharacterCreateRegisterScriptFunctions (0x004DFD00) is called from one place,
+// 0x004DA730; that call goes to h_GlueRegister, so the functions are there at the login and character screens too.
+static const uint32_t kCharCreateRegister = 0x004DFD00;
+static const uint32_t kCharCreateRegisterCall = 0x004DA730;
+
+static void __cdecl h_GlueRegister() {
+    reinterpret_cast<void(__cdecl*)()>(kCharCreateRegister)();
+    RegisterOurFunctions();
+}
+
+static bool RedirectCall(uint32_t address, const uint8_t expect[5], void* to) {
+    uint8_t a[5];
+    if (!SafeRead(address, a, 5) || memcmp(a, expect, 5) != 0) return false;
+    uint8_t* at = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(address));
+    int32_t rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(to) - reinterpret_cast<uintptr_t>(at + 5));
+    DWORD old = 0;
+    if (!VirtualProtect(at + 1, 4, PAGE_EXECUTE_READWRITE, &old)) return false;
+    memcpy(at + 1, &rel, 4);
+    DWORD ignored;
+    VirtualProtect(at + 1, 4, old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), at, 5);
+    return true;
 }
 
 // points the one call to LoadScriptFunctions at h_LoadScriptFunctions (only when the call and both functions look
@@ -411,14 +447,13 @@ static bool InstallLuaFunctions() {
     if (!SafeRead(kRegisterFunction, b, 7) || memcmp(b, reg, 7) != 0) return false;
     if (!SafeRead(kLoadScriptFunctions, c, 2) || memcmp(c, load, 2) != 0) return false;
     if (!SafeRead(0x0084E0E0, d, 4) || memcmp(d, tolstring, 4) != 0) return false;
-    uint8_t* at = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(kLoadScriptFunctionsCall));
-    int32_t rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&h_LoadScriptFunctions) - reinterpret_cast<uintptr_t>(at + 5));
-    DWORD old = 0;
-    if (!VirtualProtect(at + 1, 4, PAGE_EXECUTE_READWRITE, &old)) return false;
-    memcpy(at + 1, &rel, 4);
-    DWORD ignored;
-    VirtualProtect(at + 1, 4, old, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), at, 5);
+    if (!RedirectCall(kLoadScriptFunctionsCall, call, reinterpret_cast<void*>(&h_LoadScriptFunctions))) return false;
+    // the login screens (only when CharacterCreateRegisterScriptFunctions starts as in 12340: push esi; xor esi,esi)
+    static const uint8_t glueCall[] = {0xE8, 0xCB, 0x55, 0x00, 0x00};
+    static const uint8_t glueFn[] = {0x56, 0x33, 0xF6};
+    uint8_t e[3];
+    if (SafeRead(kCharCreateRegister, e, 3) && memcmp(e, glueFn, 3) == 0)
+        g_glueFunctions = RedirectCall(kCharCreateRegisterCall, glueCall, reinterpret_cast<void*>(&h_GlueRegister));
     return true;
 }
 
@@ -430,6 +465,8 @@ typedef void(__thiscall* NetSend_t)(void*, void*);
 typedef int(__cdecl* LuaHandleError_t)(void*);
 typedef int(__cdecl* lua_type_t)(void*, int);
 typedef const char*(__cdecl* lua_tolstring_t)(void*, int, size_t*);
+
+#include "perf_win.inc"
 
 static ProcessMessage_t o_ProcessMessage;
 static NetSend_t o_NetSend;
@@ -1240,6 +1277,7 @@ static void Start() {
         }
         Install(g_hookFatal);
         g_luaFunctions = InstallLuaFunctions();
+        StartPerf();
         if (g_trampolines) {
             DWORD old;
             VirtualProtect(g_trampolines, 4096, PAGE_EXECUTE_READ, &old);
@@ -1251,7 +1289,8 @@ static void Start() {
         h.str(", Lua errors "); h.str(g_hookLua.on ? "on" : "OFF");
         h.str(", fatal errors "); h.str(g_hookFatal.on ? "on" : "OFF");
         h.str(", filter guard "); h.str(guard ? "on" : "OFF");
-        h.str(", Lua functions "); h.str(g_luaFunctions ? "on" : "OFF");
+        h.str(", Lua functions "); h.str(g_luaFunctions ? (g_glueFunctions ? "on" : "on (game only)") : "OFF");
+        if (g_perf) h.str(", PERFORMANCE LOG");
         if (g_debug) h.str(g_debugPackets ? ", DEBUG MODE with packets" : ", DEBUG MODE");
         if (g_testMode) h.str(", TEST MODE");
     }
@@ -1291,6 +1330,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         // reserved != null: the game is closing. Crashes from here on are written on the crashing thread.
         g_exiting = true;
         if (g_debugPackets && reserved) DebugFlushPackets();   // the game is closing: other threads are gone
+        if (g_perf && reserved) PerfFlush();
         (void)reserved;
     }
     return TRUE;
