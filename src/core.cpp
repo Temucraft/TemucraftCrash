@@ -6,7 +6,7 @@ namespace tc {
 #include "../data/functions.inc"
 #include "../data/opcodes.inc"
 
-static const char kVersion[] = "1.3.0";
+static const char kVersion[] = "1.3.1";
 
 // ---- Buf ----
 

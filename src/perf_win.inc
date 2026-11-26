@@ -273,21 +273,27 @@ static void AddAsset(const char* name, int64_t ticks) {
 }
 
 // ---- the hooks ----
+//
+// Every hook hands back what the game's function left in EAX, also for the functions that look like they return
+// nothing: other code may read it. The Warden module calls FrameScript_Execute (0x00819210, which the server gives
+// it for its Lua checks) and reads EAX as a pointer to a result text; the game's function leaves 0 there (its
+// nesting counter after the decrement), so Warden skips it. 1.3.0's hook returned void, EAX held whatever our own
+// code left (0x000001E2 in the crash of 2026-11-26 08:16:41), and the Warden module read from that address.
 
-typedef void(__cdecl* Void_t)();
-typedef void(__cdecl* ExecuteRef_t)(int, void*, int, const char*, void*);
-typedef void(__thiscall* RunScript_t)(void*, const void*, int, const char*);
-typedef void(__cdecl* ExecuteStr_t)(const char*, const char*, const char*);
+typedef uint32_t(__cdecl* Void_t)();
+typedef uint32_t(__cdecl* ExecuteRef_t)(int, void*, int, const char*, void*);
+typedef uint32_t(__thiscall* RunScript_t)(void*, const void*, int, const char*);
+typedef uint32_t(__cdecl* ExecuteStr_t)(const char*, const char*, const char*);
 typedef int(__stdcall* OpenEx_t)(void*, const char*, uint32_t, void**);
 typedef int(__stdcall* SFileRead_t)(void*, void*, uint32_t, uint32_t*, void*, uint32_t);
 typedef int(__stdcall* ReadWhole_t)(void*, const char*, void**, uint32_t*, uint32_t, uint32_t, void*);
 typedef void*(__cdecl* TexCreate_t)(const char*, uint32_t, void*, uint32_t);
 typedef void*(__cdecl* TexCache_t)(const char*, uint32_t, uint32_t, uint32_t);
 typedef void*(__thiscall* CreateModel_t)(void*, const char*, uint32_t);
-typedef void(__thiscall* This1_t)(void*, uint32_t);
-typedef void(__thiscall* This2_t)(void*, uint32_t, uint32_t);
+typedef uint32_t(__thiscall* This1_t)(void*, uint32_t);
+typedef uint32_t(__thiscall* This2_t)(void*, uint32_t, uint32_t);
 typedef int(__cdecl* LuaC_t)(void*);
-typedef void(__cdecl* Screen_t)(const char*);
+typedef uint32_t(__cdecl* Screen_t)(const char*);
 typedef int(__cdecl* Idle_t)(const void*, void*);
 typedef double(__cdecl* lua_tonumber_t)(void*, int);
 
@@ -315,15 +321,12 @@ static void* g_pendingObj;
 static const void* g_pendingScript;
 
 // GxScenePresent (0x00682A00): the end of every drawn frame, at the login screens and in the world
-static void __cdecl h_Present() {
+static uint32_t __cdecl h_Present() {
     DWORD tid = CurThread();
     if (!g_frameThread) g_frameThread = tid;
-    if (tid != g_frameThread) {
-        o_Present();
-        return;
-    }
+    if (tid != g_frameThread) return o_Present();
     int tok = g_mon.Enter(perf::CAT_PRESENT, Now());
-    o_Present();
+    uint32_t r = o_Present();
     int64_t now = Now();
     g_mon.Leave(tok, now, nullptr);
     if (__atomic_load_n(&g_bgFileOps, __ATOMIC_RELAXED)) {
@@ -331,23 +334,21 @@ static void __cdecl h_Present() {
         g_mon.bgFileOps += __atomic_exchange_n(&g_bgFileOps, 0u, __ATOMIC_RELAXED);
     }
     g_mon.FrameEnd(now);
+    return r;
 }
 
 // FrameScript_Object::RunScript (0x0081A2C0): which script of the object is about to run
-static void __fastcall h_RunScript(void* self, void*, const void* script, int argc, const char* taint) {
+static uint32_t __fastcall h_RunScript(void* self, void*, const void* script, int argc, const char* taint) {
     if (OnFrameThread()) {
         g_pendingObj = self;
         g_pendingScript = script;
     }
-    o_RunScript(self, script, argc, taint);
+    return o_RunScript(self, script, argc, taint);
 }
 
 // FrameScript_Execute(function, object, argCount, taint, event) (0x00819EA0): every script handler and event
-static void __cdecl h_ExecuteRef(int function, void* object, int argc, const char* taint, void* event) {
-    if (!OnFrameThread()) {
-        o_ExecuteRef(function, object, argc, taint, event);
-        return;
-    }
+static uint32_t __cdecl h_ExecuteRef(int function, void* object, int argc, const char* taint, void* event) {
+    if (!OnFrameThread()) return o_ExecuteRef(function, object, argc, taint, event);
     uint32_t slot = 0;
     if (!event && object && object == g_pendingObj && g_pendingScript) {
         uintptr_t d = reinterpret_cast<uintptr_t>(g_pendingScript) - reinterpret_cast<uintptr_t>(object);
@@ -370,7 +371,7 @@ static void __cdecl h_ExecuteRef(int function, void* object, int argc, const cha
     }
     int depth = g_mon.Depth();
     int tok = g_mon.Enter(perf::CAT_LUA, Now());
-    o_ExecuteRef(function, object, argc, taint, event);
+    uint32_t r = o_ExecuteRef(function, object, argc, taint, event);
     int64_t d = g_mon.Leave(tok, Now(), nullptr);
     if (tok < 0) g_mon.Truncate(depth);
     if (e) {
@@ -379,14 +380,12 @@ static void __cdecl h_ExecuteRef(int function, void* object, int argc, const cha
     } else {
         g_mon.lua.AddLost(d);
     }
+    return r;
 }
 
 // FrameScript_Execute(source, fileName, taint) (0x00819210): Lua text (macros, /run, RunScript)
-static void __cdecl h_ExecuteStr(const char* source, const char* file, const char* taint) {
-    if (!OnFrameThread()) {
-        o_ExecuteStr(source, file, taint);
-        return;
-    }
+static uint32_t __cdecl h_ExecuteStr(const char* source, const char* file, const char* taint) {
+    if (!OnFrameThread()) return o_ExecuteStr(source, file, taint);
     const char* name = file ? file : "?";
     bool isNew;
     perf::NameEntry* e = g_mon.LuaName(perf::HashName(name, 200) | 1ull, &isNew);
@@ -397,7 +396,7 @@ static void __cdecl h_ExecuteStr(const char* source, const char* file, const cha
     }
     int depth = g_mon.Depth();
     int tok = g_mon.Enter(perf::CAT_LUA, Now());
-    o_ExecuteStr(source, file, taint);
+    uint32_t r = o_ExecuteStr(source, file, taint);
     int64_t d = g_mon.Leave(tok, Now(), nullptr);
     if (tok < 0) g_mon.Truncate(depth);
     if (e) {
@@ -406,6 +405,7 @@ static void __cdecl h_ExecuteStr(const char* source, const char* file, const cha
     } else {
         g_mon.lua.AddLost(d);
     }
+    return r;
 }
 
 static inline void Background(int64_t t0) {
@@ -501,24 +501,20 @@ static void* __fastcall h_CreateModel(void* self, void*, const char* name, uint3
 }
 
 // CCharacterComponent::RenderPrep(a) (0x004F1520) and CCharacterComponent::Init(a, b) (0x004F24D0)
-static void __fastcall h_RenderPrep(void* self, void*, uint32_t a) {
-    if (!OnFrameThread()) {
-        o_RenderPrep(self, a);
-        return;
-    }
+static uint32_t __fastcall h_RenderPrep(void* self, void*, uint32_t a) {
+    if (!OnFrameThread()) return o_RenderPrep(self, a);
     int tok = g_mon.Enter(perf::CAT_CHARACTER, Now());
-    o_RenderPrep(self, a);
+    uint32_t r = o_RenderPrep(self, a);
     g_mon.Leave(tok, Now(), nullptr);
+    return r;
 }
 
-static void __fastcall h_CharInit(void* self, void*, uint32_t a, uint32_t b) {
-    if (!OnFrameThread()) {
-        o_CharInit(self, a, b);
-        return;
-    }
+static uint32_t __fastcall h_CharInit(void* self, void*, uint32_t a, uint32_t b) {
+    if (!OnFrameThread()) return o_CharInit(self, a, b);
     int tok = g_mon.Enter(perf::CAT_CHARACTER, Now());
-    o_CharInit(self, a, b);
+    uint32_t r = o_CharInit(self, a, b);
     g_mon.Leave(tok, Now(), nullptr);
+    return r;
 }
 
 // the character create functions: "SetSelectedRace(3)" with the number arguments
@@ -555,28 +551,26 @@ static int __cdecl h_SetSex(void* L) { return TimedLuaC(o_SetSex, L, "SetSelecte
 static int __cdecl h_SetClass(void* L) { return TimedLuaC(o_SetClass, L, "SetSelectedClass", 1); }
 static int __cdecl h_Cycle(void* L) { return TimedLuaC(o_Cycle, L, "CycleCharCustomization", 2); }
 
-static void TimedVoid(Void_t original, const char* label) {
-    if (!OnFrameThread()) {
-        original();
-        return;
-    }
+static uint32_t TimedVoid(Void_t original, const char* label) {
+    if (!OnFrameThread()) return original();
     perf::CallMark m;
     g_mon.CallBegin(&m, Now());
-    original();
+    uint32_t r = original();
     g_mon.CallEnd(m, label, Now());
+    return r;
 }
 
-static void __cdecl h_Randomize() { TimedVoid(o_Randomize, "RandomizeCharCustomization()"); }
-static void __cdecl h_Reset() { TimedVoid(o_Reset, "ResetCharCustomize()"); }
+static uint32_t __cdecl h_Randomize() { return TimedVoid(o_Randomize, "RandomizeCharCustomization()"); }
+static uint32_t __cdecl h_Reset() { return TimedVoid(o_Reset, "ResetCharCustomize()"); }
 
 // CGlueMgr::SetScreen(name) (0x004D82A0): the login screens ("login", "charselect", "charcreate", ...)
-static void __cdecl h_SetScreen(const char* name) {
+static uint32_t __cdecl h_SetScreen(const char* name) {
     if (g_perf && (!g_frameThread || OnFrameThread())) {
         size_t len = 0;
         while (name && len < 40 && name[len]) len++;
         g_mon.Screen(name ? name : "?", len, Now());
     }
-    o_SetScreen(name);
+    return o_SetScreen(name);
 }
 
 // CGlueMgr::Idle (0x004DAB40): runs every frame while the login screens are up

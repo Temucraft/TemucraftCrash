@@ -280,3 +280,19 @@ frame object and kept. The script comes from where `RunScript`'s `ScriptIx` sits
 `tests/test_perf.cpp`, `./build/test_perf --sample` prints a made-up session), `src/perf_win.inc` (the hooks, the log
 file and the writer thread; included into `win_main.cpp`). Copy diagnostics in the launcher adds the last 60 lines of
 `Logs\TemucraftPerf.log`.
+
+## 1.3.1: Warden crash fix (2026-11-26)
+
+**The crash.** With the performance log on (debug mode or `TemucraftPerf.txt`), the game crashed at the character
+select screen about 10 s after the character list (PTR client, 2026-11-26 08:16:41): ACCESS_VIOLATION reading
+0x000001E2 in the Warden module, called from `WardenClient_Process`, right as the server's first Warden check packet
+came in. AzerothCore's Warden gives the module `FrameScript_Execute` (0x00819210) for its Lua checks
+(`WardenWin::InitializeModule`, Function2). The module calls it as `FrameScript_Execute(text, 0, 0)` and then reads
+EAX as a pointer to a result text (`test eax, eax; je skip`, then a 256-byte string copy). The game's function leaves
+0 in EAX (its nesting counter after the decrement), so the module skips the copy. The 1.3.0 "Lua text" hook was
+declared `void`, so EAX held whatever our timing code left there (0x1E2), and the module read from that address.
+
+**The fix.** Every hook now hands back what the game's function returned in EAX, also for functions that look like
+they return nothing: the perf hooks (frame, script slots, Lua handlers, Lua text, character RenderPrep / Init,
+Randomize / Reset, glue screens), `NetClient::Send`, and the two call redirects for the Lua functions. Nothing else
+changed; the report, the logs and the hook list are the same.

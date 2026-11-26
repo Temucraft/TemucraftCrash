@@ -405,9 +405,10 @@ static void RegisterOurFunctions() {
     reg("TemucraftPerfSpan", Lua_PerfSpan);
 }
 
-static void __cdecl h_LoadScriptFunctions() {
-    reinterpret_cast<void(__cdecl*)()>(kLoadScriptFunctions)();
+static uint32_t __cdecl h_LoadScriptFunctions() {
+    uint32_t r = reinterpret_cast<uint32_t(__cdecl*)()>(kLoadScriptFunctions)();
     RegisterOurFunctions();
+    return r;
 }
 
 // The login screens have their own Lua state, set up again by CGlueMgr (FrameScript_Flush, then each
@@ -416,9 +417,10 @@ static void __cdecl h_LoadScriptFunctions() {
 static const uint32_t kCharCreateRegister = 0x004DFD00;
 static const uint32_t kCharCreateRegisterCall = 0x004DA730;
 
-static void __cdecl h_GlueRegister() {
-    reinterpret_cast<void(__cdecl*)()>(kCharCreateRegister)();
+static uint32_t __cdecl h_GlueRegister() {
+    uint32_t r = reinterpret_cast<uint32_t(__cdecl*)()>(kCharCreateRegister)();
     RegisterOurFunctions();
+    return r;
 }
 
 static bool RedirectCall(uint32_t address, const uint8_t expect[5], void* to) {
@@ -461,7 +463,7 @@ static bool InstallLuaFunctions() {
 // detours (they only record, then call the game's own code)
 
 typedef int(__thiscall* ProcessMessage_t)(void*, uint32_t, void*, int);
-typedef void(__thiscall* NetSend_t)(void*, void*);
+typedef uint32_t(__thiscall* NetSend_t)(void*, void*);  // returns what the game's function left in EAX
 typedef int(__cdecl* LuaHandleError_t)(void*);
 typedef int(__cdecl* lua_type_t)(void*, int);
 typedef const char*(__cdecl* lua_tolstring_t)(void*, int, size_t*);
@@ -495,7 +497,7 @@ static int __fastcall h_ProcessMessage(void* self, void* /*edx*/, uint32_t time,
     return o_ProcessMessage(self, time, msg, a4);
 }
 
-static void __fastcall h_NetSend(void* self, void* /*edx*/, void* msg) {
+static uint32_t __fastcall h_NetSend(void* self, void* /*edx*/, void* msg) {
     const DataStore* m = static_cast<const DataStore*>(msg);
     if (m && m->data && m->read >= m->base && m->read + 4 <= m->size) {
         const uint8_t* at = m->data + (m->read - m->base);
@@ -515,7 +517,7 @@ static void __fastcall h_NetSend(void* self, void* /*edx*/, void* msg) {
             if (FindTestMarker(at, m->size - m->read, kind, sizeof(kind))) RunCrashTest(kind);
         }
     }
-    o_NetSend(self, msg);
+    return o_NetSend(self, msg);
 }
 
 static int __cdecl h_LuaHandleError(void* L) {
